@@ -1,7 +1,10 @@
 from django.urls import include, path
-from rest_framework.routers import DefaultRouter
-from .views import TaskViewSet
 
-router = DefaultRouter()
-router.register("tasks", TaskViewSet, basename="tasks")
-urlpatterns = [path("", include(router.urls))]
+urlpatterns = [
+    path("api/", include("apps.accounts.urls")),
+    path("api/", include("apps.core.urls")),
+    path("api/", include("apps.meetings.urls")),
+    path("api/", include("apps.tasks.urls")),
+    path("api/", include("apps.projects.urls")),
+    path("api/", include("apps.planner.urls")),
+]
