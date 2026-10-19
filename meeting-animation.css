@@ -1,0 +1,148 @@
+/* ------------------------------------------------------------------
+   Login "live meeting" animation  (used by MeetingAnimation.jsx)
+   Everything is prefixed lm- so it can't clash with Tailwind utilities.
+   ------------------------------------------------------------------ */
+
+/* Page-load entrance ------------------------------------------------ */
+@keyframes lm-rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: none; }
+}
+.lm-in {
+  animation: lm-rise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  animation-delay: var(--delay, 0s);
+}
+
+/* Background: sound ripples spreading from the right edge ----------- */
+@keyframes lm-ripple {
+  0%   { transform: scale(0.1); opacity: 0; }
+  15%  { opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
+}
+.lm-ripple {
+  animation: lm-ripple 9s cubic-bezier(0.2, 0.55, 0.3, 1) infinite;
+  animation-delay: var(--delay, 0s);
+}
+@keyframes lm-breathe {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50%      { opacity: 1;    transform: scale(1.08); }
+}
+.lm-breathe { animation: lm-breathe 5s ease-in-out infinite; }
+
+/* Recording indicator ---------------------------------------------- */
+@keyframes lm-rec {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.55); opacity: 1; }
+  50%      { box-shadow: 0 0 0 5px rgba(248, 113, 113, 0);  opacity: 0.55; }
+}
+.lm-rec { animation: lm-rec 1.4s ease-in-out infinite; }
+
+/* Live waveform ----------------------------------------------------- */
+@keyframes lm-wave {
+  0%, 100% { transform: scaleY(var(--lo, 0.2)); }
+  50%      { transform: scaleY(var(--hi, 1)); }
+}
+.lm-bar {
+  transform-origin: center;
+  animation: lm-wave var(--dur, 1s) ease-in-out infinite;
+  animation-delay: var(--delay, 0s);
+}
+
+/* Stage card -------------------------------------------------------- */
+@keyframes lm-stage {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.lm-stage { animation: lm-stage 0.45s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
+
+@keyframes lm-progress {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+.lm-progress { animation: lm-progress var(--ms, 5000ms) linear both; }
+
+/* Transcript lines / task rows ------------------------------------- */
+@keyframes lm-line {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.lm-line {
+  opacity: 0;
+  animation: lm-line 0.45s ease-out forwards;
+  animation-delay: var(--delay, 0s);
+}
+
+@keyframes lm-slide {
+  from { opacity: 0; transform: translateX(18px); }
+  to   { opacity: 1; transform: none; }
+}
+.lm-slide {
+  opacity: 0;
+  animation: lm-slide 0.45s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+  animation-delay: var(--delay, 0s);
+}
+
+@keyframes lm-caret { 50% { opacity: 0; } }
+.lm-caret { animation: lm-caret 1s steps(1) infinite; }
+
+/* Review: checkbox fills + tick draws ------------------------------ */
+@keyframes lm-box {
+  to { background-color: rgb(56 189 248); border-color: rgb(56 189 248); }
+}
+.lm-box {
+  animation: lm-box 0.25s ease-out forwards;
+  animation-delay: var(--delay, 0s);
+}
+@keyframes lm-draw { to { stroke-dashoffset: 0; } }
+.lm-tick {
+  stroke-dasharray: 24;
+  stroke-dashoffset: 24;
+  animation: lm-draw 0.3s ease-out forwards;
+  animation-delay: var(--delay, 0s);
+}
+
+/* Pending -> Approved swap ----------------------------------------- */
+@keyframes lm-out { to { opacity: 0; transform: translateY(-4px); } }
+@keyframes lm-inn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+.lm-out {
+  animation: lm-out 0.3s ease-in forwards;
+  animation-delay: var(--delay, 0s);
+}
+.lm-inn {
+  opacity: 0;
+  animation: lm-inn 0.35s ease-out forwards;
+  animation-delay: var(--delay, 0s);
+}
+
+/* Deliver: "assigned" badge pops ----------------------------------- */
+@keyframes lm-pop {
+  0%   { transform: scale(0.4); opacity: 0; }
+  70%  { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.lm-pop {
+  opacity: 0;
+  animation: lm-pop 0.4s ease-out forwards;
+  animation-delay: var(--delay, 0s);
+}
+
+/* Active step halo -------------------------------------------------- */
+@keyframes lm-ping {
+  0%   { transform: scale(1);    opacity: 0.7; }
+  100% { transform: scale(1.45); opacity: 0; }
+}
+.lm-ping { animation: lm-ping 1.8s ease-out infinite; }
+
+/* Respect reduced-motion settings ---------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .lm-ripple, .lm-breathe, .lm-rec, .lm-bar, .lm-caret, .lm-ping,
+  .lm-progress { animation: none !important; }
+  .lm-bar { transform: scaleY(0.6); }
+  .lm-in, .lm-stage, .lm-line, .lm-slide, .lm-box, .lm-tick,
+  .lm-out, .lm-inn, .lm-pop {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
+  }
+}
