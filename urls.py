@@ -1,21 +1,14 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
-from rest_framework_simplejwt.views import TokenRefreshView
-from .views import (
-    ChangePasswordView, EmployeeListView, ForgotPasswordView, LoginView,
-    MeView, ResetPasswordView, UserViewSet,
-)
+from .analytics import AnalyticsView
+from .views import AuditLogViewSet, DashboardView, NotificationViewSet
 
 router = DefaultRouter()
-router.register("users", UserViewSet, basename="users")
+router.register("notifications", NotificationViewSet, basename="notifications")
+router.register("audit", AuditLogViewSet, basename="audit")
 
 urlpatterns = [
-    path("auth/login/", LoginView.as_view()),
-    path("auth/refresh/", TokenRefreshView.as_view()),
-    path("auth/me/", MeView.as_view()),
-    path("auth/change-password/", ChangePasswordView.as_view()),
-    path("auth/forgot-password/", ForgotPasswordView.as_view()),
-    path("auth/reset-password/", ResetPasswordView.as_view()),
-    path("employees/", EmployeeListView.as_view()),
+    path("dashboard/", DashboardView.as_view()),
+    path("analytics/", AnalyticsView.as_view()),
     path("", include(router.urls)),
 ]
