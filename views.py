@@ -1,63 +1,81 @@
-from datetime import date
-from django.utils import timezone
+from django.db import transaction
+from django.db.models import Prefetch
 from rest_framework import viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
-from rest_framework.views import APIView
-from apps.accounts.permissions import IsMember
-from apps.meetings.models import Meeting
+from apps.accounts.permissions import IsManager
+from apps.core.services import audit
 from apps.tasks.models import Task
-from .models import Todo
-from .serializers import TodoSerializer
+from .models import BacklogItem, Project
+from .serializers import BacklogSerializer, ProjectDetailSerializer, ProjectSerializer
+from .services import resolve_assignee, sync_task
 
 
-class TodoViewSet(viewsets.ModelViewSet):
-    """Personal to-do list. Managers and employees only; each user sees only their own."""
-    serializer_class = TodoSerializer
-    permission_classes = [IsMember]
+def fresh(item):
+    return BacklogItem.objects.select_related("task__assignee").get(pk=item.pk)
+
+
+class ProjectViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsManager]
     pagination_class = None
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_serializer_class(self):
+        return ProjectDetailSerializer if self.action == "retrieve" else ProjectSerializer
 
     def get_queryset(self):
-        return Todo.objects.filter(user=self.request.user)
+        qs = Project.objects.filter(manager=self.request.user).prefetch_related(
+            Prefetch("tasks", queryset=Task.objects.select_related("assignee", "meeting", "project", "approved_by")),
+            "backlog__task", "meetings")
+        st = self.request.query_params.get("status")
+        return qs.filter(status=st) if st else qs
 
     def perform_create(self, s):
-        s.save(user=self.request.user)
+        p = s.save(manager=self.request.user)
+        audit(self.request.user, "PROJECT_CREATED", p)
 
     def perform_update(self, s):
-        was = s.instance.is_done
-        t = s.save()
-        if t.is_done != was:
-            t.done_at = timezone.now() if t.is_done else None
-            t.save(update_fields=["done_at"])
+        p = s.save()
+        audit(self.request.user, "PROJECT_UPDATED", p)
+
+    @action(detail=True, methods=["post"], url_path="backlog")
+    def add_item(self, request, pk=None):
+        p = self.get_object()
+        s = BacklogSerializer(data=request.data)
+        s.is_valid(raise_exception=True)
+        assignee = resolve_assignee(request.data.get("assignee_id"))
+        with transaction.atomic():
+            item = s.save(project=p)
+            sync_task(item, assignee, request.user)
+        audit(request.user, "BACKLOG_CREATED", item)
+        return Response(BacklogSerializer(fresh(item)).data, status=201)
 
 
-class CalendarView(APIView):
-    """Meetings, task deadlines and personal to-dos between ?start= and ?end= (YYYY-MM-DD)."""
-    permission_classes = [IsMember]
+class BacklogViewSet(viewsets.GenericViewSet):
+    permission_classes = [IsManager]
+    serializer_class = BacklogSerializer
 
-    def get(self, request):
-        try:
-            start = date.fromisoformat(request.query_params["start"])
-            end = date.fromisoformat(request.query_params["end"])
-        except (KeyError, ValueError):
-            raise ValidationError("start and end (YYYY-MM-DD) are required.")
-        if end < start or (end - start).days > 62:
-            raise ValidationError("Invalid date range.")
-        u = request.user
-        mq = Meeting.objects.filter(manager=u) if u.role == "MANAGER" else Meeting.objects.filter(participants=u)
-        tq = Task.objects.for_manager(u) if u.role == "MANAGER" else Task.objects.filter(assignee=u)
-        out = []
-        for m in mq.filter(scheduled_at__date__gte=start, scheduled_at__date__lte=end).distinct():
-            local = timezone.localtime(m.scheduled_at)
-            out.append({"kind": "meeting", "id": m.id, "title": m.title, "date": local.date().isoformat(),
-                        "time": local.strftime("%H:%M"), "status": m.status, "link": f"/meetings/{m.id}"})
-        for t in tq.filter(deadline__gte=start, deadline__lte=end).select_related("assignee"):
-            out.append({"kind": "task", "id": t.id, "title": t.title, "date": t.deadline.isoformat(), "time": None,
-                        "status": t.status, "priority": t.priority, "assignee": t.assignee.display_name,
-                        "link": f"/tasks/{t.id}"})
-        for t in Todo.objects.filter(user=u, due_date__gte=start, due_date__lte=end):
-            out.append({"kind": "todo", "id": t.id, "title": t.title, "date": t.due_date.isoformat(), "time": None,
-                        "done": t.is_done})
-        out.sort(key=lambda x: (x["date"], x["time"] or "99:99"))
-        return Response(out)
+    def get_queryset(self):
+        return BacklogItem.objects.filter(project__manager=self.request.user).select_related("project", "task__assignee")
+
+    def partial_update(self, request, pk=None):
+        item = self.get_object()
+        s = BacklogSerializer(item, data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        task = getattr(item, "task", None)
+        if "assignee_id" in request.data:
+            assignee = resolve_assignee(request.data["assignee_id"])
+        else:
+            assignee = task.assignee if task else None
+        with transaction.atomic():
+            item = s.save()
+            sync_task(item, assignee, request.user)
+        return Response(BacklogSerializer(fresh(item)).data)
+
+    def destroy(self, request, pk=None):
+        item = self.get_object()
+        if getattr(item, "task", None) is not None:
+            raise ValidationError("Assigned items cannot be deleted.")
+        item.delete()
+        return Response(status=204)

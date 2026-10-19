@@ -1,28 +1,48 @@
-from django.conf import settings
-from django.core.mail import send_mail
-from .models import AuditLog, Notification
+from django.utils import timezone
+from rest_framework.exceptions import ValidationError
+from apps.accounts.models import User
+from apps.core.services import audit, notify
+from apps.tasks.models import Task, TaskEvent
 
 
-def audit(actor, action, target=None, **detail):
-    AuditLog.objects.create(
-        actor=actor if getattr(actor, "pk", None) else None, action=action,
-        target_type=target.__class__.__name__ if target is not None else "",
-        target_id=str(target.pk) if target is not None else "", detail=detail)
-
-
-def notify(user, kind, title, message="", link="", dedupe_key=None):
-    """In-app notification always; email only if Gmail SMTP is configured. Never claims a send that didn't happen."""
-    if dedupe_key and Notification.objects.filter(dedupe_key=dedupe_key).exists():
+def resolve_assignee(val):
+    if val in (None, ""):
         return None
-    n = Notification.objects.create(user=user, kind=kind, title=title, message=message,
-                                    link=link, dedupe_key=dedupe_key)
-    if settings.EMAIL_HOST_USER and settings.EMAIL_HOST_PASSWORD and user.email:
-        try:
-            send_mail(title, message or title, settings.DEFAULT_FROM_EMAIL, [user.email])
-            n.email_status = "SENT"
-        except Exception:
-            n.email_status = "FAILED"
-    else:
-        n.email_status = "NOT_CONFIGURED"
-    n.save(update_fields=["email_status"])
-    return n
+    try:
+        return User.objects.get(pk=int(val), role="EMPLOYEE", is_active=True)
+    except (User.DoesNotExist, ValueError, TypeError):
+        raise ValidationError({"assignee_id": "Choose an active employee."})
+
+
+def sync_task(item, assignee, actor):
+    """Create the task on first assignment, or push edits and reassignment to the existing task."""
+    task = getattr(item, "task", None)
+    if task is None:
+        if assignee is None:
+            return None
+        task = Task.objects.create(
+            project=item.project, backlog_item=item, title=item.title, description=item.description,
+            assignee=assignee, deadline=item.deadline, priority=item.priority,
+            approved_by=actor, approved_at=timezone.now())
+        TaskEvent.objects.create(task=task, actor=actor, description="Task created from project backlog")
+        notify(assignee, "TASK_ASSIGNED", f"New task: {task.title}", f"Project: {item.project.name}",
+               f"/tasks/{task.id}", dedupe_key=f"assigned-{task.id}")
+        audit(actor, "BACKLOG_ASSIGNED", item, task=task.id, assignee=assignee.id)
+        return task
+    if assignee is None:
+        raise ValidationError("An assigned item cannot be unassigned.")
+    changed = task.assignee_id != assignee.id
+    if changed and task.status == "DONE":
+        raise ValidationError("Completed tasks cannot be reassigned.")
+    if changed and task.status == "IN_REVIEW":
+        raise ValidationError("This task is waiting for proof review. Approve it or ask for changes before reassigning.")
+    task.title, task.description = item.title, item.description
+    task.deadline, task.priority = item.deadline, item.priority
+    if changed:
+        task.assignee = assignee
+    task.save()
+    if changed:
+        TaskEvent.objects.create(task=task, actor=actor, description=f"Reassigned to {assignee.display_name}")
+        notify(assignee, "TASK_ASSIGNED", f"New task: {task.title}", f"Project: {item.project.name}", f"/tasks/{task.id}")
+        audit(actor, "TASK_REASSIGNED", task, to=assignee.id)
+    return task
