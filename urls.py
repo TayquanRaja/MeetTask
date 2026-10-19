@@ -1,8 +1,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
-from .views import MeetingViewSet, OutputViewSet
+from .views import CalendarView, TodoViewSet
 
 router = DefaultRouter()
-router.register("meetings", MeetingViewSet, basename="meetings")
-router.register("outputs", OutputViewSet, basename="outputs")
-urlpatterns = [path("", include(router.urls))]
+router.register("todos", TodoViewSet, basename="todos")
+urlpatterns = [path("calendar/", CalendarView.as_view()), path("", include(router.urls))]

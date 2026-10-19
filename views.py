@@ -1,125 +1,63 @@
-import os
-from django.conf import settings
+from datetime import date
+from django.utils import timezone
 from rest_framework import viewsets
-from rest_framework.decorators import action
-from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
-from apps.accounts.permissions import IsManager
-from apps.core.services import audit
-from .models import AIOutput, Meeting
-from .serializers import MeetingSerializer, OutputSerializer
-from .services import approval, pipeline
+from rest_framework.views import APIView
+from apps.accounts.permissions import IsMember
+from apps.meetings.models import Meeting
+from apps.tasks.models import Task
+from .models import Todo
+from .serializers import TodoSerializer
 
 
-class MeetingViewSet(viewsets.ModelViewSet):
-    serializer_class = MeetingSerializer
-    http_method_names = ["get", "post", "put", "patch", "head", "options"]  # no delete
-
-    def get_permissions(self):
-        if self.action in ("create", "update", "partial_update", "upload_audio"):
-            return [IsManager()]
-        return [IsAuthenticated()]
+class TodoViewSet(viewsets.ModelViewSet):
+    """Personal to-do list. Managers and employees only; each user sees only their own."""
+    serializer_class = TodoSerializer
+    permission_classes = [IsMember]
+    pagination_class = None
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
-        u, qs = self.request.user, Meeting.objects.all()
-        if u.role == "MANAGER":
-            qs = qs.filter(manager=u)
-        elif u.role == "EMPLOYEE":
-            qs = qs.filter(participants=u)
-        else:
-            return Meeting.objects.none()
-        q, st = self.request.query_params.get("q"), self.request.query_params.get("status")
-        if q:
-            qs = qs.filter(title__icontains=q)
-        if st:
-            qs = qs.filter(status=st)
-        return qs.distinct()
+        return Todo.objects.filter(user=self.request.user)
 
     def perform_create(self, s):
-        m = s.save()
-        audit(self.request.user, "MEETING_CREATED", m)
+        s.save(user=self.request.user)
 
-    @action(detail=True, methods=["post"], url_path="upload-audio")
-    def upload_audio(self, request, pk=None):
-        m = self.get_object()
-        f = request.FILES.get("audio")
-        if not f:
-            raise ValidationError("No audio file provided (field name: 'audio').")
-        ext = os.path.splitext(f.name)[1].lower()
-        if ext not in settings.ALLOWED_AUDIO_EXT:
-            raise ValidationError(f"Unsupported format. Allowed: {', '.join(sorted(settings.ALLOWED_AUDIO_EXT))}")
-        if f.size > settings.MAX_AUDIO_MB * 1024 * 1024:
-            raise ValidationError(f"File too large. Max {settings.MAX_AUDIO_MB} MB.")
-        if m.status == "PROCESSING":
-            raise ValidationError("Already processing.")
-        if m.status == "APPROVED":
-            raise ValidationError("Approved meetings cannot be reprocessed.")
-        if not m.links.exists():
-            raise ValidationError("Add at least one participant first.")
-        m.audio.save(f"meeting_{m.id}{ext}", f)
-        m.status = "PROCESSING"
-        m.save(update_fields=["status"])
-        audit(request.user, "AUDIO_UPLOADED", m, size=f.size)
-        pipeline.start(m.id)
-        return Response({"status": "PROCESSING"}, status=202)
+    def perform_update(self, s):
+        was = s.instance.is_done
+        t = s.save()
+        if t.is_done != was:
+            t.done_at = timezone.now() if t.is_done else None
+            t.save(update_fields=["done_at"])
 
-    @action(detail=True, methods=["get"])
-    def transcript(self, request, pk=None):
-        m = self.get_object()
-        t = getattr(m, "transcript", None)
-        if not t:
-            return Response({"available": False})
+
+class CalendarView(APIView):
+    """Meetings, task deadlines and personal to-dos between ?start= and ?end= (YYYY-MM-DD)."""
+    permission_classes = [IsMember]
+
+    def get(self, request):
+        try:
+            start = date.fromisoformat(request.query_params["start"])
+            end = date.fromisoformat(request.query_params["end"])
+        except (KeyError, ValueError):
+            raise ValidationError("start and end (YYYY-MM-DD) are required.")
+        if end < start or (end - start).days > 62:
+            raise ValidationError("Invalid date range.")
         u = request.user
-        if u.role == "MANAGER":
-            audit(u, "TRANSCRIPT_VIEWED", m)
-            return Response({"available": True, "source": t.source,
-                             "original": t.original_text, "sanitized": t.sanitized_text})
-        if m.is_confidential:
-            raise PermissionDenied("Transcript of a confidential meeting is restricted to the manager.")
-        return Response({"available": True, "source": t.source, "sanitized": t.sanitized_text})
-
-    @action(detail=True, methods=["get"])
-    def output(self, request, pk=None):
-        m = self.get_object()
-        qs = m.outputs.all()
-        if request.user.role != "MANAGER":
-            qs = qs.filter(status="APPROVED")
-        o = qs.first()
-        return Response(OutputSerializer(o).data if o else None)
-
-
-class OutputViewSet(viewsets.GenericViewSet):
-    serializer_class = OutputSerializer
-    permission_classes = [IsManager]
-
-    def get_queryset(self):
-        return AIOutput.objects.filter(meeting__manager=self.request.user)
-
-    def partial_update(self, request, pk=None):
-        o = self.get_object()
-        if o.status != "PENDING_REVIEW":
-            raise ValidationError("Only outputs pending review can be edited.")
-        s = self.get_serializer(o, data=request.data, partial=True)
-        s.is_valid(raise_exception=True)
-        s.save()
-        audit(request.user, "OUTPUT_EDITED", o, fields=list(s.validated_data.keys()))
-        return Response(s.data)
-
-    @action(detail=True, methods=["post"])
-    def approve(self, request, pk=None):
-        o = self.get_object()
-        out, created = approval.approve(o.pk, request.user)
-        return Response({"status": out.status, "tasks_created": created})
-
-    @action(detail=True, methods=["post"])
-    def reject(self, request, pk=None):
-        o = self.get_object()
-        approval.reject(o.pk, request.user, request.data.get("reason", ""))
-        return Response({"status": "REJECTED"})
-
-    @action(detail=True, methods=["post"])
-    def resubmit(self, request, pk=None):
-        o = self.get_object()
-        approval.resubmit(o.pk, request.user)
-        return Response({"status": "PENDING_REVIEW"})
+        mq = Meeting.objects.filter(manager=u) if u.role == "MANAGER" else Meeting.objects.filter(participants=u)
+        tq = Task.objects.for_manager(u) if u.role == "MANAGER" else Task.objects.filter(assignee=u)
+        out = []
+        for m in mq.filter(scheduled_at__date__gte=start, scheduled_at__date__lte=end).distinct():
+            local = timezone.localtime(m.scheduled_at)
+            out.append({"kind": "meeting", "id": m.id, "title": m.title, "date": local.date().isoformat(),
+                        "time": local.strftime("%H:%M"), "status": m.status, "link": f"/meetings/{m.id}"})
+        for t in tq.filter(deadline__gte=start, deadline__lte=end).select_related("assignee"):
+            out.append({"kind": "task", "id": t.id, "title": t.title, "date": t.deadline.isoformat(), "time": None,
+                        "status": t.status, "priority": t.priority, "assignee": t.assignee.display_name,
+                        "link": f"/tasks/{t.id}"})
+        for t in Todo.objects.filter(user=u, due_date__gte=start, due_date__lte=end):
+            out.append({"kind": "todo", "id": t.id, "title": t.title, "date": t.due_date.isoformat(), "time": None,
+                        "done": t.is_done})
+        out.sort(key=lambda x: (x["date"], x["time"] or "99:99"))
+        return Response(out)
