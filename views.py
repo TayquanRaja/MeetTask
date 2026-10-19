@@ -1,172 +1,125 @@
-
-from datetime import timedelta
-
-from django.db.models import Count
-from django.utils import timezone
-
-from rest_framework import mixins, serializers, viewsets
+import os
+from django.conf import settings
+from rest_framework import viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
-
-from apps.accounts.models import User
-from apps.accounts.permissions import IsAdmin
-from apps.meetings.models import Meeting
-from apps.tasks.models import Task
-
-from .models import AuditLog, Notification
+from apps.accounts.permissions import IsManager
+from apps.core.services import audit
+from .models import AIOutput, Meeting
+from .serializers import MeetingSerializer, OutputSerializer
+from .services import approval, pipeline
 
 
-class NotificationSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Notification
-        fields = [
-            "id",
-            "kind",
-            "title",
-            "message",
-            "link",
-            "is_read",
-            "email_status",
-            "created_at",
-        ]
+class MeetingViewSet(viewsets.ModelViewSet):
+    serializer_class = MeetingSerializer
+    http_method_names = ["get", "post", "put", "patch", "head", "options"]  # no delete
 
-
-class NotificationViewSet(
-    mixins.ListModelMixin,
-    viewsets.GenericViewSet
-):
-    serializer_class = NotificationSerializer
+    def get_permissions(self):
+        if self.action in ("create", "update", "partial_update", "upload_audio"):
+            return [IsManager()]
+        return [IsAuthenticated()]
 
     def get_queryset(self):
-        return Notification.objects.filter(user=self.request.user)
+        u, qs = self.request.user, Meeting.objects.all()
+        if u.role == "MANAGER":
+            qs = qs.filter(manager=u)
+        elif u.role == "EMPLOYEE":
+            qs = qs.filter(participants=u)
+        else:
+            return Meeting.objects.none()
+        q, st = self.request.query_params.get("q"), self.request.query_params.get("status")
+        if q:
+            qs = qs.filter(title__icontains=q)
+        if st:
+            qs = qs.filter(status=st)
+        return qs.distinct()
 
-    @action(detail=False, methods=["post"])
-    def mark_all_read(self, request):
-        self.get_queryset().update(is_read=True)
-        return Response({"ok": True})
+    def perform_create(self, s):
+        m = s.save()
+        audit(self.request.user, "MEETING_CREATED", m)
+
+    @action(detail=True, methods=["post"], url_path="upload-audio")
+    def upload_audio(self, request, pk=None):
+        m = self.get_object()
+        f = request.FILES.get("audio")
+        if not f:
+            raise ValidationError("No audio file provided (field name: 'audio').")
+        ext = os.path.splitext(f.name)[1].lower()
+        if ext not in settings.ALLOWED_AUDIO_EXT:
+            raise ValidationError(f"Unsupported format. Allowed: {', '.join(sorted(settings.ALLOWED_AUDIO_EXT))}")
+        if f.size > settings.MAX_AUDIO_MB * 1024 * 1024:
+            raise ValidationError(f"File too large. Max {settings.MAX_AUDIO_MB} MB.")
+        if m.status == "PROCESSING":
+            raise ValidationError("Already processing.")
+        if m.status == "APPROVED":
+            raise ValidationError("Approved meetings cannot be reprocessed.")
+        if not m.links.exists():
+            raise ValidationError("Add at least one participant first.")
+        m.audio.save(f"meeting_{m.id}{ext}", f)
+        m.status = "PROCESSING"
+        m.save(update_fields=["status"])
+        audit(request.user, "AUDIO_UPLOADED", m, size=f.size)
+        pipeline.start(m.id)
+        return Response({"status": "PROCESSING"}, status=202)
+
+    @action(detail=True, methods=["get"])
+    def transcript(self, request, pk=None):
+        m = self.get_object()
+        t = getattr(m, "transcript", None)
+        if not t:
+            return Response({"available": False})
+        u = request.user
+        if u.role == "MANAGER":
+            audit(u, "TRANSCRIPT_VIEWED", m)
+            return Response({"available": True, "source": t.source,
+                             "original": t.original_text, "sanitized": t.sanitized_text})
+        if m.is_confidential:
+            raise PermissionDenied("Transcript of a confidential meeting is restricted to the manager.")
+        return Response({"available": True, "source": t.source, "sanitized": t.sanitized_text})
+
+    @action(detail=True, methods=["get"])
+    def output(self, request, pk=None):
+        m = self.get_object()
+        qs = m.outputs.all()
+        if request.user.role != "MANAGER":
+            qs = qs.filter(status="APPROVED")
+        o = qs.first()
+        return Response(OutputSerializer(o).data if o else None)
+
+
+class OutputViewSet(viewsets.GenericViewSet):
+    serializer_class = OutputSerializer
+    permission_classes = [IsManager]
+
+    def get_queryset(self):
+        return AIOutput.objects.filter(meeting__manager=self.request.user)
+
+    def partial_update(self, request, pk=None):
+        o = self.get_object()
+        if o.status != "PENDING_REVIEW":
+            raise ValidationError("Only outputs pending review can be edited.")
+        s = self.get_serializer(o, data=request.data, partial=True)
+        s.is_valid(raise_exception=True)
+        s.save()
+        audit(request.user, "OUTPUT_EDITED", o, fields=list(s.validated_data.keys()))
+        return Response(s.data)
 
     @action(detail=True, methods=["post"])
-    def read(self, request, pk=None):
-        self.get_queryset().filter(pk=pk).update(is_read=True)
-        return Response({"ok": True})
+    def approve(self, request, pk=None):
+        o = self.get_object()
+        out, created = approval.approve(o.pk, request.user)
+        return Response({"status": out.status, "tasks_created": created})
 
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        o = self.get_object()
+        approval.reject(o.pk, request.user, request.data.get("reason", ""))
+        return Response({"status": "REJECTED"})
 
-class AuditSerializer(serializers.ModelSerializer):
-    actor_name = serializers.CharField(
-        source="actor.username",
-        default=None,
-        read_only=True,
-    )
-
-    class Meta:
-        model = AuditLog
-        fields = [
-            "id",
-            "actor_name",
-            "action",
-            "target_type",
-            "target_id",
-            "detail",
-            "created_at",
-        ]
-
-
-class AuditLogViewSet(
-    mixins.ListModelMixin,
-    viewsets.GenericViewSet
-):
-    serializer_class = AuditSerializer
-    permission_classes = [IsAdmin]
-    queryset = AuditLog.objects.select_related("actor")
-
-
-class DashboardView(APIView):
-    def get(self, request):
-        u = request.user
-        today = timezone.localdate()
-
-        active = ["PENDING", "IN_PROGRESS"]
-
-        # Manager dashboard
-        if u.role == "MANAGER":
-            tasks = Task.objects.for_manager(u)
-            meetings = Meeting.objects.filter(manager=u)
-
-            return Response({
-                "total_meetings": meetings.count(),
-                "awaiting_review": meetings.filter(
-                    status="PENDING_REVIEW"
-                ).count(),
-                "approved_meetings": meetings.filter(
-                    status="APPROVED"
-                ).count(),
-                "active_tasks": tasks.filter(
-                    status__in=active + ["IN_REVIEW"]
-                ).count(),
-                "proofs_awaiting": tasks.filter(
-                    status="IN_REVIEW"
-                ).count(),
-                "completed_tasks": tasks.filter(
-                    status="DONE"
-                ).count(),
-                "overdue_tasks": tasks.filter(
-                    status__in=active,
-                    deadline__lt=today,
-                ).count(),
-            })
-
-        # Employee dashboard
-        if u.role == "EMPLOYEE":
-            tasks = Task.objects.filter(assignee=u)
-
-            return Response({
-                "assigned_tasks": tasks.count(),
-                "upcoming_deadlines": tasks.filter(
-                    status__in=active,
-                    deadline__gte=today,
-                    deadline__lte=today + timedelta(days=7),
-                ).count(),
-                "in_progress": tasks.filter(
-                    status="IN_PROGRESS"
-                ).count(),
-                "in_review": tasks.filter(
-                    status="IN_REVIEW"
-                ).count(),
-                "completed_tasks": tasks.filter(
-                    status="DONE"
-                ).count(),
-                "overdue_tasks": tasks.filter(
-                    status__in=active,
-                    deadline__lt=today,
-                ).count(),
-            })
-
-        # Admin dashboard
-        if u.role == "ADMIN":
-            return Response({
-                "users": dict(
-                    User.objects.order_by()
-                    .values_list("role")
-                    .annotate(c=Count("id"))
-                ),
-                "active_users": User.objects.filter(
-                    is_active=True
-                ).count(),
-                "meetings": dict(
-                    Meeting.objects.order_by()
-                    .values_list("status")
-                    .annotate(c=Count("id"))
-                ),
-                "tasks": dict(
-                    Task.objects.order_by()
-                    .values_list("status")
-                    .annotate(c=Count("id"))
-                ),
-                "recent_audit": AuditSerializer(
-                    AuditLog.objects.select_related("actor")[:10],
-                    many=True,
-                ).data,
-            })
-
-        return Response({})
+    @action(detail=True, methods=["post"])
+    def resubmit(self, request, pk=None):
+        o = self.get_object()
+        approval.resubmit(o.pk, request.user)
+        return Response({"status": "PENDING_REVIEW"})
