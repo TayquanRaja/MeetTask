@@ -1,8 +1,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
-from .views import BacklogViewSet, ProjectViewSet
+from .views import TaskViewSet
 
 router = DefaultRouter()
-router.register("projects", ProjectViewSet, basename="projects")
-router.register("backlog", BacklogViewSet, basename="backlog")
+router.register("tasks", TaskViewSet, basename="tasks")
 urlpatterns = [path("", include(router.urls))]
